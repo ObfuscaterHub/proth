@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: prometheus-obfuscator
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
