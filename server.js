@@ -13,7 +13,11 @@ const LOCAL_LUA_BIN = path.join(__dirname, "vendor", "bin", "lua5.1");
 const LUA_BIN = fs.existsSync(LOCAL_LUA_BIN) ? LOCAL_LUA_BIN : "lua5.1";
 
 const CACHE_MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || "40", 10);
+
 const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || "300000", 10);
+
+const MAX_OOM_RETRIES = parseInt(process.env.MAX_OOM_RETRIES || "3", 10);
+const OOM_RETRY_DELAY_MS = parseInt(process.env.OOM_RETRY_DELAY_MS || "500", 10);
 
 app.use(compression());
 app.use(express.json({ limit: "10mb" }));
@@ -94,7 +98,7 @@ class JobQueue {
 
 const jobQueue = new JobQueue(MAX_CONCURRENT_JOBS);
 
-const resultCache = new Map(); // key -> output string
+const resultCache = new Map();
 
 function cacheKey(code, preset) {
   return crypto.createHash("sha256").update(preset).update("\0").update(code).digest("hex");
@@ -116,6 +120,10 @@ function cacheSet(key, value) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function runObfuscation(sourceCode, preset, onChild) {
   return new Promise((resolve, reject) => {
     const args = ["prometheus-main.lua", "--preset", preset, "--out", "-", "-"];
@@ -126,8 +134,14 @@ function runObfuscation(sourceCode, preset, onChild) {
       { cwd: LUA_SRC_DIR, timeout: JOB_TIMEOUT_MS, maxBuffer: 100 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
-          if (err.killed || err.signal) {
+          if (err.killed && err.signal === "SIGTERM") {
             return reject(new Error("Obfuscation was cancelled or timed out."));
+          }
+          if (err.killed || err.signal) {
+            console.error(`Obfuscation child killed by signal ${err.signal} (likely out of memory)`);
+            const oomErr = new Error("Obfuscation was interrupted (server ran low on memory). Please try again.");
+            oomErr.isOom = true;
+            return reject(oomErr);
           }
           return reject(new Error(extractCleanError(stderr, stdout, err.message)));
         }
@@ -140,10 +154,37 @@ function runObfuscation(sourceCode, preset, onChild) {
 
     if (typeof onChild === "function") onChild(child);
 
-    child.stdin.on("error", () => {}); // avoid unhandled EPIPE if the process exits early on bad input
+    child.stdin.on("error", () => {});
     child.stdin.write(sourceCode);
     child.stdin.end();
   });
+}
+
+async function runObfuscationWithRetry(code, preset, getActiveChild, isClientGone) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= MAX_OOM_RETRIES; attempt++) {
+    if (isClientGone()) throw lastErr || new Error("Client disconnected.");
+
+    try {
+      const result = await jobQueue.run(() =>
+        runObfuscation(code, preset, (child) => {
+          getActiveChild(child);
+          if (isClientGone()) child.kill("SIGKILL");
+        })
+      );
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (!err.isOom || attempt === MAX_OOM_RETRIES) {
+        throw err;
+      }
+      console.error(`OOM on attempt ${attempt}/${MAX_OOM_RETRIES}, retrying...`);
+      await sleep(OOM_RETRY_DELAY_MS);
+    }
+  }
+
+  throw lastErr;
 }
 
 app.post("/api/obfuscate", upload.none(), async (req, res) => {
@@ -151,11 +192,9 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
   let clientGone = false;
 
   const onClientClose = () => {
-    if (res.writableEnded) return; // we already responded; this is a normal close
+    if (res.writableEnded) return;
     clientGone = true;
     if (activeChild) {
-      // The requester went away (closed tab, retried, aborted) - no point
-      // burning CPU/RAM finishing an obfuscation nobody will read.
       activeChild.kill("SIGKILL");
     }
   };
@@ -181,29 +220,30 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
     }
 
     const tQueueStart = Date.now();
-    let tJobStart = null;
 
-    const result = await jobQueue.run(() => {
-      tJobStart = Date.now();
-      return runObfuscation(code, preset, (child) => {
+    const result = await runObfuscationWithRetry(
+      code,
+      preset,
+      (child) => {
         activeChild = child;
-        if (clientGone) child.kill("SIGKILL");
-      });
-    });
+      },
+      () => clientGone
+    );
 
     const tJobEnd = Date.now();
-    const queueMs = tJobStart - tQueueStart;
-    const jobMs = tJobEnd - tJobStart;
+    const totalMs = tJobEnd - tQueueStart;
 
-    if (clientGone) return; // nobody listening anymore, don't bother writing a response
+    if (clientGone) return;
 
     cacheSet(key, result);
-    res.set("X-Queue-Time", String(queueMs));
-    res.set("X-Processing-Time", String(jobMs));
-    res.json({ output: result, cached: false, queueMs, jobMs });
+    res.set("X-Processing-Time", String(totalMs));
+    res.json({ output: result, cached: false, totalMs });
   } catch (err) {
     if (clientGone) return;
     const message = err.message || "Obfuscation failed.";
+    if (/low on memory/i.test(message)) {
+      return res.status(503).json({ error: message, type: "out_of_memory" });
+    }
     const type = /Parsing Error/i.test(message) ? "syntax_error" : "obfuscation_error";
     res.status(400).json({ error: message, type });
   } finally {
@@ -217,6 +257,7 @@ app.get("/api/health", (req, res) =>
     activeJobs: jobQueue.active,
     queuedJobs: jobQueue.queued,
     maxConcurrentJobs: jobQueue.maxConcurrent,
+    maxOomRetries: MAX_OOM_RETRIES,
     cacheSize: resultCache.size,
     cacheMaxEntries: CACHE_MAX_ENTRIES,
   })
@@ -225,5 +266,6 @@ app.get("/api/health", (req, res) =>
 app.listen(PORT, () => {
   console.log(`Prometheus web UI running on port ${PORT}`);
   console.log(`Max concurrent obfuscation jobs: ${MAX_CONCURRENT_JOBS}`);
+  console.log(`Max OOM retries: ${MAX_OOM_RETRIES}`);
   console.log(`Result cache size: ${CACHE_MAX_ENTRIES}`);
 });
