@@ -92,9 +92,9 @@ function AntiTamper:apply(ast, pipeline)
                     return type(value) ~= "number" or type(stats.FrameTime) ~= "number"
                 end,
                 function()
-                    local value = tonumber(os.date("%S"))
+                    local value = tonumber(os.date("%%S"))
                     task.wait(1.1)
-                    return not value or tonumber(os.date("%S")) == value
+                    return not value or tonumber(os.date("%%S")) == value
                 end,
                 function()
                     local value = workspace.DistributedGameTime
