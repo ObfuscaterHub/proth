@@ -12,6 +12,16 @@ const LUA_SRC_DIR = path.join(__dirname, "lua-src");
 const LOCAL_LUA_BIN = path.join(__dirname, "vendor", "bin", "lua5.1");
 const LUA_BIN = fs.existsSync(LOCAL_LUA_BIN) ? LOCAL_LUA_BIN : "lua5.1";
 
+// How many lua5.1 obfuscation processes are allowed to run at the same time.
+// This is the single most important knob for memory safety: each running
+// job can use anywhere from ~30MB (Minify/Weak) to 700MB+ (Ultra), and they
+// are NOT capped individually - they're capped by how many can exist at
+// once. Extra requests beyond this limit are queued (FIFO), not rejected,
+// so rapid repeated calls stay fast and safe instead of piling up memory.
+// Tune this down (1) on very memory-constrained hosts (e.g. Suga Free's
+// 256MB), or up on a bigger box.
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "3", 10);
+
 // How many most-recent distinct (code, preset) results to keep in memory.
 // A cache hit skips spawning lua5.1 entirely and returns in well under a
 // millisecond, which is what makes *repeated* identical requests fast -
@@ -52,17 +62,6 @@ function extractCleanError(rawStderr, rawStdout, fallbackMessage) {
   }
   return lines[0] || "Obfuscation failed.";
 }
-
-// How many lua5.1 obfuscation processes are allowed to run at the same time.
-// This is the single most important knob for memory safety: each running
-// job can use anywhere from ~30MB (Minify/Weak) to 700MB+ (Ultra), and they
-// are NOT capped individually - they're capped by how many can exist at
-// once. Extra requests beyond this limit are queued (FIFO), not rejected,
-// so rapid repeated calls stay fast and safe instead of piling up memory.
-// Based on load testing, this host can comfortably run about 4-5 jobs
-// concurrently before memory gets tight, so default to 5; override with
-// MAX_CONCURRENT_JOBS.
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "5", 10);
 
 // --- Tiny FIFO concurrency queue ------------------------------------------
 // No external dependency: a fixed number of "slots" are handed out in
