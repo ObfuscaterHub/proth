@@ -12,16 +12,6 @@ const LUA_SRC_DIR = path.join(__dirname, "lua-src");
 const LOCAL_LUA_BIN = path.join(__dirname, "vendor", "bin", "lua5.1");
 const LUA_BIN = fs.existsSync(LOCAL_LUA_BIN) ? LOCAL_LUA_BIN : "lua5.1";
 
-// How many lua5.1 obfuscation processes are allowed to run at the same time.
-// This is the single most important knob for memory safety: each running
-// job can use anywhere from ~30MB (Minify/Weak) to 700MB+ (Ultra), and they
-// are NOT capped individually - they're capped by how many can exist at
-// once. Extra requests beyond this limit are queued (FIFO), not rejected,
-// so rapid repeated calls stay fast and safe instead of piling up memory.
-// Tune this down (1) on very memory-constrained hosts (e.g. Suga Free's
-// 256MB), or up on a bigger box.
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10);
-
 // How many most-recent distinct (code, preset) results to keep in memory.
 // A cache hit skips spawning lua5.1 entirely and returns in well under a
 // millisecond, which is what makes *repeated* identical requests fast -
@@ -63,55 +53,11 @@ function extractCleanError(rawStderr, rawStdout, fallbackMessage) {
   return lines[0] || "Obfuscation failed.";
 }
 
-// --- Tiny FIFO concurrency queue ------------------------------------------
-// No external dependency: a fixed number of "slots" are handed out in
-// request order. A job that can't get a slot immediately waits in line;
-// whoever finishes first hands their slot to the next person waiting.
-class JobQueue {
-  constructor(maxConcurrent) {
-    this.maxConcurrent = Math.max(1, maxConcurrent);
-    this.active = 0;
-    this.waiting = [];
-  }
-
-  get queued() {
-    return this.waiting.length;
-  }
-
-  run(task) {
-    return new Promise((resolve, reject) => {
-      const attempt = () => {
-        this.active++;
-        task()
-          .then((result) => {
-            this.active--;
-            this._next();
-            resolve(result);
-          })
-          .catch((err) => {
-            this.active--;
-            this._next();
-            reject(err);
-          });
-      };
-
-      if (this.active < this.maxConcurrent) {
-        attempt();
-      } else {
-        this.waiting.push(attempt);
-      }
-    });
-  }
-
-  _next() {
-    if (this.waiting.length > 0 && this.active < this.maxConcurrent) {
-      const next = this.waiting.shift();
-      next();
-    }
-  }
-}
-
-const jobQueue = new JobQueue(MAX_CONCURRENT_JOBS);
+// Simple counter of in-flight obfuscation jobs, kept only for the
+// /api/health endpoint - there's no queueing or slot limiting anymore,
+// every request spawns its own lua5.1 process immediately and they all
+// run at the same time.
+let activeJobCount = 0;
 
 // --- Tiny FIFO result cache ------------------------------------------------
 // Keyed by a hash of (preset + code), so re-submitting the exact same
@@ -211,12 +157,16 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
       return res.json({ output: cached, cached: true });
     }
 
-    const result = await jobQueue.run(() =>
-      runObfuscation(code, preset, (child) => {
+    activeJobCount++;
+    let result;
+    try {
+      result = await runObfuscation(code, preset, (child) => {
         activeChild = child;
         if (clientGone) child.kill("SIGKILL");
-      })
-    );
+      });
+    } finally {
+      activeJobCount--;
+    }
 
     if (clientGone) return; // nobody listening anymore, don't bother writing a response
 
@@ -235,9 +185,7 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
 app.get("/api/health", (req, res) =>
   res.json({
     ok: true,
-    activeJobs: jobQueue.active,
-    queuedJobs: jobQueue.queued,
-    maxConcurrentJobs: jobQueue.maxConcurrent,
+    activeJobs: activeJobCount,
     cacheSize: resultCache.size,
     cacheMaxEntries: CACHE_MAX_ENTRIES,
   })
@@ -245,6 +193,5 @@ app.get("/api/health", (req, res) =>
 
 app.listen(PORT, () => {
   console.log(`Prometheus web UI running on port ${PORT}`);
-  console.log(`Max concurrent obfuscation jobs: ${MAX_CONCURRENT_JOBS}`);
   console.log(`Result cache size: ${CACHE_MAX_ENTRIES}`);
 });
