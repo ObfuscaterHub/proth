@@ -20,7 +20,7 @@ const LUA_BIN = fs.existsSync(LOCAL_LUA_BIN) ? LOCAL_LUA_BIN : "lua5.1";
 // so rapid repeated calls stay fast and safe instead of piling up memory.
 // Tune this down (1) on very memory-constrained hosts (e.g. Suga Free's
 // 256MB), or up on a bigger box.
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "2", 10);
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10);
 
 // How many most-recent distinct (code, preset) results to keep in memory.
 // A cache hit skips spawning lua5.1 entirely and returns in well under a
