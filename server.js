@@ -12,24 +12,7 @@ const LUA_SRC_DIR = path.join(__dirname, "lua-src");
 const LOCAL_LUA_BIN = path.join(__dirname, "vendor", "bin", "lua5.1");
 const LUA_BIN = fs.existsSync(LOCAL_LUA_BIN) ? LOCAL_LUA_BIN : "lua5.1";
 
-// How many lua5.1 obfuscation processes are allowed to run at the same time.
-// This is the single most important knob for memory safety: each running
-// job can use anywhere from ~30MB (Minify/Weak) to 700MB+ (Ultra), and they
-// are NOT capped individually - they're capped by how many can exist at
-// once. Extra requests beyond this limit are queued (FIFO), not rejected,
-// so rapid repeated calls stay fast and safe instead of piling up memory.
-// Tune this down (1) on very memory-constrained hosts (e.g. Suga Free's
-// 256MB), or up on a bigger box.
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "3.5", 10);
-
-// How many most-recent distinct (code, preset) results to keep in memory.
-// A cache hit skips spawning lua5.1 entirely and returns in well under a
-// millisecond, which is what makes *repeated* identical requests fast -
-// re-clicking "Obfuscate" on the same script/preset, or a client retrying
-// after a network hiccup, no longer costs a full obfuscation run.
 const CACHE_MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || "40", 10);
-
-// Hard ceiling per job, independent of how long the queue in front of it is.
 const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || "300000", 10);
 
 app.use(compression());
@@ -63,10 +46,8 @@ function extractCleanError(rawStderr, rawStdout, fallbackMessage) {
   return lines[0] || "Obfuscation failed.";
 }
 
-// --- Tiny FIFO concurrency queue ------------------------------------------
-// No external dependency: a fixed number of "slots" are handed out in
-// request order. A job that can't get a slot immediately waits in line;
-// whoever finishes first hands their slot to the next person waiting.
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "3", 10);
+
 class JobQueue {
   constructor(maxConcurrent) {
     this.maxConcurrent = Math.max(1, maxConcurrent);
@@ -113,10 +94,6 @@ class JobQueue {
 
 const jobQueue = new JobQueue(MAX_CONCURRENT_JOBS);
 
-// --- Tiny FIFO result cache ------------------------------------------------
-// Keyed by a hash of (preset + code), so re-submitting the exact same
-// script+preset - the common case when someone is iterating/retrying -
-// never touches lua5.1 at all.
 const resultCache = new Map(); // key -> output string
 
 function cacheKey(code, preset) {
@@ -126,8 +103,6 @@ function cacheKey(code, preset) {
 function cacheGet(key) {
   if (!resultCache.has(key)) return undefined;
   const value = resultCache.get(key);
-  // refresh recency: delete + re-set moves it to the end of Map's
-  // iteration order, which we use as our eviction order below.
   resultCache.delete(key);
   resultCache.set(key, value);
   return value;
@@ -141,7 +116,6 @@ function cacheSet(key, value) {
   }
 }
 
-// --- Obfuscation runner ----------------------------------------------------
 function runObfuscation(sourceCode, preset, onChild) {
   return new Promise((resolve, reject) => {
     const args = ["prometheus-main.lua", "--preset", preset, "--out", "-", "-"];
@@ -176,11 +150,6 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
   let activeChild = null;
   let clientGone = false;
 
-  // Note: req's own "close" event fires as soon as the incoming request
-  // body has been fully read, which happens almost immediately - it does
-  // NOT mean the client went away. res's "close" event is what actually
-  // reflects "the client disconnected before we could respond", so that's
-  // what we watch to decide whether to abort the in-flight job.
   const onClientClose = () => {
     if (res.writableEnded) return; // we already responded; this is a normal close
     clientGone = true;
@@ -211,17 +180,27 @@ app.post("/api/obfuscate", upload.none(), async (req, res) => {
       return res.json({ output: cached, cached: true });
     }
 
-    const result = await jobQueue.run(() =>
-      runObfuscation(code, preset, (child) => {
+    const tQueueStart = Date.now();
+    let tJobStart = null;
+
+    const result = await jobQueue.run(() => {
+      tJobStart = Date.now();
+      return runObfuscation(code, preset, (child) => {
         activeChild = child;
         if (clientGone) child.kill("SIGKILL");
-      })
-    );
+      });
+    });
+
+    const tJobEnd = Date.now();
+    const queueMs = tJobStart - tQueueStart;
+    const jobMs = tJobEnd - tJobStart;
 
     if (clientGone) return; // nobody listening anymore, don't bother writing a response
 
     cacheSet(key, result);
-    res.json({ output: result, cached: false });
+    res.set("X-Queue-Time", String(queueMs));
+    res.set("X-Processing-Time", String(jobMs));
+    res.json({ output: result, cached: false, queueMs, jobMs });
   } catch (err) {
     if (clientGone) return;
     const message = err.message || "Obfuscation failed.";
